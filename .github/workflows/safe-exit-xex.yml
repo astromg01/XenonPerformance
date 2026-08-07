@@ -1,0 +1,303 @@
+name: Xenon Performance v1.8.7 safe-exit XEX
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/safe-exit-xex.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xenon-performance-v187-safe-exit
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build safe-return Xbox 360 title XEX
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    steps:
+      - name: Install small host-only build set
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils binutils-powerpc-linux-gnu \
+            cmake ninja-build git python3 ca-certificates zip
+
+      - name: Build PowerPC safe-exit title and SynthXEX
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build_xex_safe_exit"
+          SRC="$OUT/synthxex-src"
+          BUILD="$OUT/synthxex-build"
+          REL="$OUT/release"
+          LOG="$OUT/build.log"
+          COMMIT="48d1453a55468aa2f8a211db0b20edd594ef5be3"
+          mkdir -p "$OUT" "$REL"
+          : > "$LOG"
+          exec > >(tee -a "$LOG") 2>&1
+
+          cat > "$OUT/safe_exit_ppc.s" <<'ASM'
+          # Xenon Performance v1.8.7 safe-exit smoke test.
+          # Read-only until the final kernel call. It resolves kernel exports dynamically.
+          # 0x193 = XexExecutableModuleHandle (exported variable)
+          # 0x1A2 = XexUnloadImageAndExitThread(module_handle, exit_code)
+
+          .set KERN_ORDINAL_XEX_EXECUTABLE_MODULE_HANDLE, 0x193
+          .set KERN_ORDINAL_XEX_UNLOAD_IMAGE_AND_EXIT_THREAD, 0x1A2
+
+          .section .text
+          .global _start
+
+          _start:
+              # Resolve address of XexExecutableModuleHandle.
+              li      r3, KERN_ORDINAL_XEX_EXECUTABLE_MODULE_HANDLE
+              bl      getKernelExportByOrdinal
+              cmpwi   r3, 0
+              beq     fail_closed
+
+              # Export 0x193 is a variable; load the current executable module handle.
+              lwz     r30, 0(r3)
+              cmpwi   r30, 0
+              beq     fail_closed
+
+              # Resolve XexUnloadImageAndExitThread.
+              li      r3, KERN_ORDINAL_XEX_UNLOAD_IMAGE_AND_EXIT_THREAD
+              bl      getKernelExportByOrdinal
+              cmpwi   r3, 0
+              beq     fail_closed
+
+              # Correct title shutdown: XexUnloadImageAndExitThread(hModule, 0).
+              mtctr   r3
+              mr      r3, r30
+              li      r4, 0
+              bctrl
+
+              # The function is not expected to return.
+              b       fail_closed
+
+          # Read a little-endian 32-bit value from an address in r3.
+          # Returns the host-order value in r3.
+          get32BitLittleEndian:
+              li      r4, 24
+              lbz     r5, 3(r3)
+              slw     r5, r5, r4
+              subi    r4, r4, 8
+
+              lbz     r6, 2(r3)
+              slw     r6, r6, r4
+              subi    r4, r4, 8
+              or      r5, r5, r6
+
+              lbz     r6, 1(r3)
+              slw     r6, r6, r4
+              or      r5, r5, r6
+
+              lbz     r6, 0(r3)
+              or      r5, r5, r6
+              mr      r3, r5
+              blr
+
+          # r3 = ordinal. Returns address of kernel export in r3, or 0.
+          getKernelExportByOrdinal:
+              mflr    r12
+              mr      r7, r3
+
+              # Kernel PE base is 0x80040000. PE header RVA is at +0x3c.
+              lis     r3, 0x8004
+              ori     r3, r3, 0x003c
+              bl      get32BitLittleEndian
+              addis   r3, r3, 0x8004
+
+              # Export directory RVA is PE header + 0x78.
+              addi    r3, r3, 0x78
+              bl      get32BitLittleEndian
+              addis   r3, r3, 0x8004
+
+              # Validate ordinal against export count at +0x14.
+              mr      r8, r3
+              addi    r3, r3, 0x14
+              bl      get32BitLittleEndian
+              cmpw    r7, r3
+              bgt     kernel_export_not_found
+
+              # Export address table RVA at +0x1c.
+              subi    r7, r7, 1
+              addi    r3, r8, 0x1c
+              bl      get32BitLittleEndian
+              addis   r3, r3, 0x8004
+
+              # Read export RVA at EAT[(ordinal - 1)] and convert to VA.
+              mulli   r7, r7, 4
+              add     r3, r3, r7
+              bl      get32BitLittleEndian
+              addis   r3, r3, 0x8004
+
+              mtlr    r12
+              blr
+
+          kernel_export_not_found:
+              li      r3, 0
+              mtlr    r12
+              blr
+
+          # Fail closed instead of returning through an invalid LR.
+          # This path should never execute on a normal Xbox 360 kernel.
+          fail_closed:
+              b       fail_closed
+          ASM
+
+          echo 'XPXEXSAFE1 stage=ppc_assemble begin'
+          powerpc-linux-gnu-as -mregnames -mppc64 "$OUT/safe_exit_ppc.s" -o "$OUT/safe_exit_ppc.o"
+          powerpc-linux-gnu-objcopy -O binary -j .text "$OUT/safe_exit_ppc.o" "$OUT/safe_exit_ppc.bin"
+          powerpc-linux-gnu-objdump -dr "$OUT/safe_exit_ppc.o" > "$REL/safe_exit_ppc.disasm.txt"
+          test -s "$OUT/safe_exit_ppc.bin"
+          grep -q '193' "$OUT/safe_exit_ppc.s"
+          grep -q '1A2' "$OUT/safe_exit_ppc.s"
+          echo 'XPXEXSAFE1 stage=ppc_assemble pass'
+
+          printf '.section .text\n.globl _start\n_start:\n.incbin "%s"\n' "$OUT/safe_exit_ppc.bin" > "$OUT/wrapper.s"
+          as --32 "$OUT/wrapper.s" -o "$OUT/wrapper.o"
+          ld -mi386pe --subsystem 14 \
+            --major-subsystem-version 1 --minor-subsystem-version 0 \
+            --major-os-version 0 --minor-os-version 0 \
+            --disable-dynamicbase --image-base 0x82000000 \
+            --section-alignment 0x10000 --file-alignment 0x200 \
+            --disable-long-section-names -e _start \
+            -o "$OUT/XenonPerformanceSafeExit.exe" "$OUT/wrapper.o"
+
+          python3 - "$OUT/XenonPerformanceSafeExit.exe" "$OUT/safe_exit_ppc.bin" <<'PY'
+          import struct,sys,hashlib
+          pe_path, raw_path=sys.argv[1:]
+          d=open(pe_path,'rb').read(); raw=open(raw_path,'rb').read(); errors=[]
+          if d[:2] != b'MZ': errors.append('missing MZ')
+          pe=struct.unpack_from('<I',d,0x3c)[0]
+          if d[pe:pe+4] != b'PE\0\0': errors.append('missing PE')
+          sections=struct.unpack_from('<H',d,pe+6)[0]
+          optsz=struct.unpack_from('<H',d,pe+20)[0]
+          chars=struct.unpack_from('<H',d,pe+22)[0]
+          opt=pe+24
+          entry=struct.unpack_from('<I',d,opt+16)[0]
+          base=struct.unpack_from('<I',d,opt+28)[0]
+          align=struct.unpack_from('<I',d,opt+32)[0]
+          subsystem=struct.unpack_from('<H',d,opt+68)[0]
+          if chars & 0x2000: errors.append('unexpected DLL flag')
+          if subsystem != 0x000e: errors.append('not Xbox subsystem')
+          if base != 0x82000000: errors.append('image base')
+          if align != 0x10000: errors.append('alignment')
+          st=opt+optsz; found=False
+          for i in range(sections):
+              s=st+i*40
+              vs,va,rs,rp=struct.unpack_from('<IIII',d,s+8)
+              if va <= entry < va+max(vs,rs):
+                  pos=rp+(entry-va); found=True
+                  if d[pos:pos+len(raw)] != raw: errors.append('PPC payload mismatch')
+          if not found: errors.append('entry mapping')
+          if len(raw) < 64: errors.append('PPC payload too small')
+          if errors: raise SystemExit('XPPE187 FAIL: '+', '.join(errors))
+          print('XPPE187 PASS pe_sha256='+hashlib.sha256(d).hexdigest()+' ppc_sha256='+hashlib.sha256(raw).hexdigest())
+          PY
+
+          echo 'XPXEXSAFE1 stage=synthxex begin'
+          git init -q "$SRC"
+          git -C "$SRC" remote add origin https://github.com/OpenXeChain/SynthXEX.git
+          git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
+          git -C "$SRC" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT"
+          cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD" --parallel 4
+          test -x "$BUILD/synthxex"
+
+          "$BUILD/synthxex" --skip-machine-check \
+            --input "$OUT/XenonPerformanceSafeExit.exe" \
+            --output "$REL/XenonPerformanceSafeExit.xex" \
+            --type title
+
+          python3 - "$REL/XenonPerformanceSafeExit.xex" <<'PY'
+          import struct,sys,hashlib,json,os
+          p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
+          if len(d) < 256: errors.append('too small')
+          if d[:4] != b'XEX2': errors.append('missing XEX2')
+          flags=0; ids=[]
+          if not errors:
+              flags,peoff,res,secoff,count=struct.unpack('>IIIII',d[4:24])
+              if not (flags & 0x1): errors.append('TITLE flag missing')
+              if flags & 0x8: errors.append('DLL flag unexpectedly set')
+              if 24+count*8 > len(d): errors.append('header table outside file')
+              if not errors:
+                  ids=[struct.unpack('>II',d[24+i*8:32+i*8])[0] for i in range(count)]
+                  if 0x00010100 not in ids: errors.append('entry header missing')
+              if peoff and peoff >= len(d): errors.append('PE offset outside file')
+              if secoff and secoff >= len(d): errors.append('security offset outside file')
+          if errors: raise SystemExit('XPXEX187 FAIL: '+', '.join(errors))
+          print('XPXEX187 PASS sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          cat > "$REL/README_FIRST_RUN.txt" <<'TXT'
+          XENON PERFORMANCE v1.8.7 — SAFE-EXIT TITLE XEX TEST
+
+          Purpose: verify that a generated title XEX can enter and return cleanly without rebooting the console.
+
+          What it does:
+          - dynamically reads the Xbox kernel export table;
+          - reads XexExecutableModuleHandle (ordinal 0x193);
+          - calls XexUnloadImageAndExitThread(hModule, 0) (ordinal 0x1A2);
+          - performs no game-memory writes, no SMC writes, no NAND/flash writes and no optimization changes.
+
+          FIRST TEST:
+          1. Do NOT add this file to DashLaunch plugins or launch.ini.
+          2. Launch XenonPerformanceSafeExit.xex once from XeXMenu/Aurora.
+          3. PASS: it returns to the launcher/dashboard without reboot, freeze or fatal error.
+          4. FAIL: reboot/freeze/error. Do not launch it again; report exactly what happened.
+          TXT
+
+          python3 - "$OUT/XenonPerformanceSafeExit.exe" "$REL/XenonPerformanceSafeExit.xex" "$REL/XPXEXSAFE1.json" <<'PY'
+          import sys,hashlib,json,os
+          pe,xex,out=sys.argv[1:]
+          def info(p):
+              d=open(p,'rb').read(); return {'name':os.path.basename(p),'size':len(d),'sha256':hashlib.sha256(d).hexdigest()}
+          r={
+            'schema':'XPXEXSAFE1','version':'1.8.7',
+            'purpose':'safe title XEX enter/clean-exit smoke test only',
+            'kernel_exports':{'XexExecutableModuleHandle':'0x193','XexUnloadImageAndExitThread':'0x1A2'},
+            'writes':0,'nand_flash_writes':0,'game_memory_writes':0,'smc_writes':0,
+            'pe':info(pe),'xex':info(xex),'synthxex_commit':'48d1453a55468aa2f8a211db0b20edd594ef5be3'
+          }
+          open(out,'w').write(json.dumps(r,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(r,indent=2,sort_keys=True))
+          PY
+
+          cp "$OUT/XenonPerformanceSafeExit.exe" "$REL/"
+          (cd "$REL" && zip -9 XenonPerformance-v1.8.7-Safe-Exit-XEX.zip \
+            XenonPerformanceSafeExit.xex XenonPerformanceSafeExit.exe \
+            README_FIRST_RUN.txt XPXEXSAFE1.json safe_exit_ppc.disasm.txt)
+          echo 'XPXEXSAFE1 PASS'
+
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.8.7-safe-exit-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build_xex_safe_exit/build.log
+            build_xex_safe_exit/safe_exit_ppc.s
+            build_xex_safe_exit/safe_exit_ppc.bin
+            build_xex_safe_exit/release/safe_exit_ppc.disasm.txt
+            build_xex_safe_exit/XenonPerformanceSafeExit.exe
+
+      - name: Upload safe-exit XEX bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.8.7-Safe-Exit-XEX
+          compression-level: 9
+          retention-days: 14
+          path: build_xex_safe_exit/release/
