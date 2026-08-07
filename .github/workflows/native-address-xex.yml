@@ -1,0 +1,281 @@
+name: Xenon Performance v1.8.9 native-address XEX
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-address-xex.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xenon-performance-v189-native-address
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build native-address Xbox 360 title XEX
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    steps:
+      - name: Install small host-only build set
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils binutils-powerpc-linux-gnu \
+            cmake ninja-build git python3 ca-certificates zip
+
+      - name: Build corrected PowerPC title and SynthXEX
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build_xex_native_address"
+          SRC="$OUT/synthxex-src"
+          BUILD="$OUT/synthxex-build"
+          REL="$OUT/release"
+          LOG="$OUT/build.log"
+          COMMIT="48d1453a55468aa2f8a211db0b20edd594ef5be3"
+          mkdir -p "$OUT" "$REL"
+          : > "$LOG"
+          exec > >(tee -a "$LOG") 2>&1
+
+          cat > "$OUT/native_address_ppc.s" <<'ASM'
+          # Xenon Performance v1.8.9 native-address title smoke test.
+          # Fixes two independent problems in the previous synthetic titles:
+          # 1) construct 0x80040000 as a ZERO-EXTENDED 32-bit effective address
+          #    on the 64-bit Xenon CPU instead of a sign-extended 0xFFFFFFFF80040000;
+          # 2) the PE machine field is changed to POWERPCBE (0x01F2) and SynthXEX
+          #    is run WITHOUT --skip-machine-check.
+          # No game/NAND/SMC writes are performed.
+
+          .set ORD_XEX_EXECUTABLE_MODULE_HANDLE, 0x193
+          .set ORD_XEX_UNLOAD_IMAGE_AND_EXIT_THREAD, 0x1A2
+
+          .section .text
+          .global _start
+
+          _start:
+              # 64-bit PowerPC stack frame, preserving 16-byte alignment.
+              stdu    r1, -0x100(r1)
+              std     r30, 0x80(r1)
+
+              li      r3, ORD_XEX_EXECUTABLE_MODULE_HANDLE
+              bl      get_kernel_export
+              cmpwi   r3, 0
+              beq     fail_closed
+
+              lwz     r30, 0(r3)
+              cmpwi   r30, 0
+              beq     fail_closed
+
+              li      r3, ORD_XEX_UNLOAD_IMAGE_AND_EXIT_THREAD
+              bl      get_kernel_export
+              cmpwi   r3, 0
+              beq     fail_closed
+
+              # XexUnloadImageAndExitThread(hModule, 0). Expected not to return.
+              mtctr   r3
+              mr      r3, r30
+              li      r4, 0
+              bctrl
+
+          fail_closed:
+              b       fail_closed
+
+          # r3 -> little-endian 32-bit PE field, result in r3.
+          get_le32:
+              lbz     r4, 0(r3)
+              lbz     r5, 1(r3)
+              lbz     r6, 2(r3)
+              lbz     r10, 3(r3)
+              slwi    r5, r5, 8
+              slwi    r6, r6, 16
+              slwi    r10, r10, 24
+              or      r4, r4, r5
+              or      r4, r4, r6
+              or      r3, r4, r10
+              blr
+
+          # Build zero-extended 0x0000000080040000 in r9.
+          load_kernel_base:
+              lis     r9, 0x8004
+              clrldi  r9, r9, 32
+              blr
+
+          # r3 = ordinal. Returns export VA in r3 or zero.
+          get_kernel_export:
+              mflr    r11
+              mr      r7, r3
+
+              bl      load_kernel_base
+              addi    r3, r9, 0x3c
+              bl      get_le32
+              add     r3, r3, r9
+
+              addi    r3, r3, 0x78
+              bl      get_le32
+              add     r3, r3, r9
+
+              mr      r8, r3
+              addi    r3, r8, 0x14
+              bl      get_le32
+              cmpw    r7, r3
+              bgt     export_not_found
+
+              subi    r7, r7, 1
+              addi    r3, r8, 0x1c
+              bl      get_le32
+              add     r3, r3, r9
+
+              mulli   r7, r7, 4
+              add     r3, r3, r7
+              bl      get_le32
+              add     r3, r3, r9
+
+              mtlr    r11
+              blr
+
+          export_not_found:
+              li      r3, 0
+              mtlr    r11
+              blr
+          ASM
+
+          echo 'XPXEX189 stage=ppc begin'
+          powerpc-linux-gnu-as -mregnames -mppc64 "$OUT/native_address_ppc.s" -o "$OUT/native_address_ppc.o"
+          powerpc-linux-gnu-objcopy -O binary -j .text "$OUT/native_address_ppc.o" "$OUT/native_address_ppc.bin"
+          powerpc-linux-gnu-objdump -dr "$OUT/native_address_ppc.o" > "$REL/native_address_ppc.disasm.txt"
+          grep -q 'clrldi' "$REL/native_address_ppc.disasm.txt"
+          grep -q 'stdu' "$REL/native_address_ppc.disasm.txt"
+          test -s "$OUT/native_address_ppc.bin"
+          echo 'XPXEX189 stage=ppc pass'
+
+          # Host PE wrapper only supplies PE layout. The actual .text payload is PPC64 Xenon code.
+          printf '.section .text\n.globl _start\n_start:\n.incbin "%s"\n' "$OUT/native_address_ppc.bin" > "$OUT/wrapper.s"
+          as --32 "$OUT/wrapper.s" -o "$OUT/wrapper.o"
+          ld -mi386pe --subsystem 14 \
+            --major-subsystem-version 1 --minor-subsystem-version 0 \
+            --major-os-version 0 --minor-os-version 0 \
+            --disable-dynamicbase --image-base 0x82000000 \
+            --section-alignment 0x10000 --file-alignment 0x200 \
+            --disable-long-section-names -e _start \
+            -o "$OUT/XenonPerformanceNativeAddress.exe" "$OUT/wrapper.o"
+
+          # Make the PE identify as Xbox PowerPCBE instead of i386.
+          python3 - "$OUT/XenonPerformanceNativeAddress.exe" "$OUT/native_address_ppc.bin" <<'PY'
+          import struct,sys,hashlib
+          pe_path,raw_path=sys.argv[1:]
+          d=bytearray(open(pe_path,'rb').read()); raw=open(raw_path,'rb').read(); errors=[]
+          if d[:2] != b'MZ': errors.append('MZ')
+          pe=struct.unpack_from('<I',d,0x3c)[0]
+          if d[pe:pe+4] != b'PE\0\0': errors.append('PE')
+          struct.pack_into('<H',d,pe+4,0x01F2)
+          open(pe_path,'wb').write(d)
+          machine=struct.unpack_from('<H',d,pe+4)[0]
+          optsz=struct.unpack_from('<H',d,pe+20)[0]; opt=pe+24
+          entry=struct.unpack_from('<I',d,opt+16)[0]
+          base=struct.unpack_from('<I',d,opt+28)[0]
+          align=struct.unpack_from('<I',d,opt+32)[0]
+          subsystem=struct.unpack_from('<H',d,opt+68)[0]
+          sections=struct.unpack_from('<H',d,pe+6)[0]
+          st=opt+optsz; found=False
+          if machine != 0x01F2: errors.append('machine')
+          if subsystem != 0x000E: errors.append('subsystem')
+          if base != 0x82000000: errors.append('image_base')
+          if align != 0x10000: errors.append('alignment')
+          for i in range(sections):
+              s=st+i*40; vs,va,rs,rp=struct.unpack_from('<IIII',d,s+8)
+              if va <= entry < va+max(vs,rs):
+                  found=True; pos=rp+(entry-va)
+                  if d[pos:pos+len(raw)] != raw: errors.append('payload')
+          if not found: errors.append('entry')
+          if errors: raise SystemExit('XPPE189 FAIL '+','.join(errors))
+          print('XPPE189 PASS machine=0x%04X sha256=%s'%(machine,hashlib.sha256(d).hexdigest()))
+          PY
+
+          echo 'XPXEX189 stage=synthxex begin'
+          git init -q "$SRC"
+          git -C "$SRC" remote add origin https://github.com/OpenXeChain/SynthXEX.git
+          git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
+          git -C "$SRC" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT"
+          cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD" --parallel 4
+
+          # Deliberately NO --skip-machine-check here.
+          "$BUILD/synthxex" \
+            --input "$OUT/XenonPerformanceNativeAddress.exe" \
+            --output "$REL/XenonPerformanceNativeAddress.xex" \
+            --type title
+
+          python3 - "$REL/XenonPerformanceNativeAddress.xex" <<'PY'
+          import struct,sys,hashlib
+          d=open(sys.argv[1],'rb').read(); errors=[]
+          if d[:4] != b'XEX2': errors.append('XEX2')
+          if len(d)<256: errors.append('size')
+          if not errors:
+              flags,peoff,res,secoff,count=struct.unpack('>IIIII',d[4:24])
+              if not flags & 1: errors.append('TITLE')
+              if flags & 8: errors.append('DLL')
+              ids=[struct.unpack('>II',d[24+i*8:32+i*8])[0] for i in range(count)]
+              if 0x00010100 not in ids: errors.append('entry_header')
+          if errors: raise SystemExit('XPXEX189 FAIL '+','.join(errors))
+          print('XPXEX189 PASS sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          cat > "$REL/README_FIRST_RUN.txt" <<'TXT'
+          XENON PERFORMANCE v1.8.9 — NATIVE-ADDRESS TITLE TEST
+
+          Changes vs v1.8.8:
+          - fixes sign-extension of 0x80040000 on the Xenon 64-bit PowerPC CPU;
+          - uses a 64-bit PowerPC stack frame;
+          - PE Machine is POWERPCBE 0x01F2;
+          - SynthXEX machine validation is NOT skipped.
+
+          No game-memory, NAND/flash, or SMC writes are performed.
+
+          TEST ONCE from XeXMenu/Aurora. Do not install as a plugin.
+          PASS: returns to launcher without Fatal Crash/reboot/freeze.
+          FAIL: stop testing and report exactly what happened.
+          TXT
+
+          python3 - "$REL/XenonPerformanceNativeAddress.xex" "$REL/XPXEX189.json" <<'PY'
+          import sys,hashlib,json,os
+          p,o=sys.argv[1:]; d=open(p,'rb').read()
+          r={'schema':'XPXEX189','version':'1.8.9','writes':0,'pe_machine':'0x01F2','skip_machine_check':False,'xex':{'name':os.path.basename(p),'size':len(d),'sha256':hashlib.sha256(d).hexdigest()}}
+          open(o,'w').write(json.dumps(r,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(r,indent=2,sort_keys=True))
+          PY
+
+          cp "$OUT/XenonPerformanceNativeAddress.exe" "$REL/"
+          (cd "$REL" && zip -9 XenonPerformance-v1.8.9-Native-Address-XEX.zip \
+            XenonPerformanceNativeAddress.xex XenonPerformanceNativeAddress.exe \
+            README_FIRST_RUN.txt XPXEX189.json native_address_ppc.disasm.txt)
+          echo 'XPXEX189 PASS'
+
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.8.9-native-address-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build_xex_native_address/build.log
+            build_xex_native_address/native_address_ppc.s
+            build_xex_native_address/native_address_ppc.bin
+            build_xex_native_address/release/native_address_ppc.disasm.txt
+            build_xex_native_address/XenonPerformanceNativeAddress.exe
+
+      - name: Upload native-address XEX bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.8.9-Native-Address-XEX
+          compression-level: 9
+          retention-days: 14
+          path: build_xex_native_address/release/
