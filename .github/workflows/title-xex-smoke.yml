@@ -1,0 +1,190 @@
+name: Xenon Performance v1.8.6 executable XEX smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/title-xex-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xenon-performance-v186-title-xex
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build executable Xbox 360 title XEX
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    steps:
+      - name: Install small host-only build set
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential binutils cmake ninja-build git python3 ca-certificates zip
+
+      - name: Build executable PE wrapper and SynthXEX
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build_xex_title"
+          SRC="$OUT/synthxex-src"
+          BUILD="$OUT/synthxex-build"
+          REL="$OUT/release"
+          LOG="$OUT/build.log"
+          COMMIT="48d1453a55468aa2f8a211db0b20edd594ef5be3"
+          mkdir -p "$OUT" "$REL"
+          : > "$LOG"
+
+          exec > >(tee -a "$LOG") 2>&1
+          echo 'XPXEXTITLE1 stage=pe begin'
+
+          # Minimal PowerPC title entry: return 0 immediately.
+          # No imports, no writes, no persistent state, no patch logic.
+          cat > "$OUT/ppc_title_stub.s" <<'ASM'
+          .section .text
+          .globl _start
+          _start:
+              .byte 0x38, 0x60, 0x00, 0x00
+              .byte 0x4e, 0x80, 0x00, 0x20
+          ASM
+
+          as --32 "$OUT/ppc_title_stub.s" -o "$OUT/ppc_title_stub.o"
+          ld -mi386pe --subsystem 14 \
+            --major-subsystem-version 1 --minor-subsystem-version 0 \
+            --major-os-version 0 --minor-os-version 0 \
+            --disable-dynamicbase --image-base 0x82000000 \
+            --section-alignment 0x10000 --file-alignment 0x200 \
+            --disable-long-section-names -e _start \
+            -o "$OUT/XenonPerformanceTest.exe" "$OUT/ppc_title_stub.o"
+
+          python3 - "$OUT/XenonPerformanceTest.exe" <<'PY'
+          import struct,sys,hashlib
+          p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
+          if d[:2] != b'MZ': errors.append('missing MZ')
+          pe=struct.unpack_from('<I',d,0x3c)[0]
+          if d[pe:pe+4] != b'PE\0\0': errors.append('missing PE')
+          machine=struct.unpack_from('<H',d,pe+4)[0]
+          sections=struct.unpack_from('<H',d,pe+6)[0]
+          optsz=struct.unpack_from('<H',d,pe+20)[0]
+          chars=struct.unpack_from('<H',d,pe+22)[0]
+          opt=pe+24
+          entry=struct.unpack_from('<I',d,opt+16)[0]
+          base=struct.unpack_from('<I',d,opt+28)[0]
+          align=struct.unpack_from('<I',d,opt+32)[0]
+          subsystem=struct.unpack_from('<H',d,opt+68)[0]
+          if machine != 0x14c: errors.append('machine')
+          if chars & 0x2000: errors.append('unexpected DLL characteristic')
+          if subsystem != 0x000e: errors.append('not Xbox subsystem')
+          if base != 0x82000000: errors.append('image base')
+          if align != 0x10000: errors.append('alignment')
+          st=opt+optsz; found=False
+          for i in range(sections):
+              s=st+i*40
+              vs,va,rs,rp,fl=struct.unpack_from('<IIIIxxxxxxxxxxxxI',d,s+8)
+              if va <= entry < va+max(vs,rs):
+                  pos=rp+(entry-va); code=d[pos:pos+8]; found=True
+                  if code != bytes.fromhex('386000004e800020'): errors.append('entry bytes')
+          if not found: errors.append('entry mapping')
+          if errors: raise SystemExit('XPPE_TITLE1 FAIL: '+', '.join(errors))
+          print('XPPE_TITLE1 PASS sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          echo 'XPXEXTITLE1 stage=pe pass'
+
+          git init -q "$SRC"
+          git -C "$SRC" remote add origin https://github.com/OpenXeChain/SynthXEX.git
+          git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
+          git -C "$SRC" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT"
+          echo "XPXEXTITLE1 stage=synthxex_source pass commit=$COMMIT"
+
+          cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD" --parallel 4
+          test -x "$BUILD/synthxex"
+          echo 'XPXEXTITLE1 stage=synthxex_host pass'
+
+          "$BUILD/synthxex" --skip-machine-check \
+            --input "$OUT/XenonPerformanceTest.exe" \
+            --output "$REL/XenonPerformanceTest.xex" \
+            --type title
+
+          python3 - "$REL/XenonPerformanceTest.xex" <<'PY'
+          import struct,sys,hashlib
+          p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
+          if len(d) < 256: errors.append('too small')
+          if d[:4] != b'XEX2': errors.append('missing XEX2')
+          if not errors:
+              flags,peoff,res,secoff,count=struct.unpack('>IIIII',d[4:24])
+              if not (flags & 0x1): errors.append('title flag missing')
+              if flags & 0x8: errors.append('unexpected DLL flag')
+              if 24+count*8 > len(d): errors.append('header table outside file')
+              ids=[]
+              if not errors:
+                  for i in range(count): ids.append(struct.unpack('>II',d[24+i*8:32+i*8])[0])
+                  if 0x00010100 not in ids: errors.append('entry header missing')
+              if peoff and peoff >= len(d): errors.append('PE offset outside file')
+              if secoff and secoff >= len(d): errors.append('security offset outside file')
+          if errors: raise SystemExit('XPXEX_TITLE1 FAIL: '+', '.join(errors))
+          print('XPXEX_TITLE1 PASS sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          cat > "$REL/FIRST_RUN.txt" <<'TXT'
+          XENON PERFORMANCE v1.8.6 — EXECUTABLE XEX SMOKE TEST
+
+          Purpose: verify that XEXMenu/Aurora can launch a title-style XEX built by the fast OpenXeChain/SynthXEX route.
+
+          This build is intentionally inert:
+          - no game patches
+          - no memory writes
+          - no SMC writes
+          - no NAND/flash writes
+          - no plugin install
+          - no persistent changes
+
+          HOW TO TEST:
+          1. Copy XenonPerformanceTest.xex to a normal folder on HDD/USB.
+          2. Launch it once from XEXMenu/Aurora.
+          3. Expected behavior: it launches and immediately returns/terminates cleanly. There is no UI yet.
+          4. PASS: no fatal error, no hang, no console reset.
+          5. FAIL: photograph any error or describe exactly what happens.
+
+          Do NOT add this file to DashLaunch plugin slots or launch.ini.
+          TXT
+
+          python3 - "$OUT/XenonPerformanceTest.exe" "$REL/XenonPerformanceTest.xex" "$REL/XPXEXTITLE1.json" <<'PY'
+          import sys,hashlib,json,os
+          pe,xex,out=sys.argv[1:]
+          def info(p):
+              d=open(p,'rb').read(); return {'name':os.path.basename(p),'size':len(d),'sha256':hashlib.sha256(d).hexdigest()}
+          r={'schema':'XPXEXTITLE1','version':'1.8.6','purpose':'inert executable title XEX launch smoke test','module_type':'title','writes':0,'nand_flash_writes':0,'game_memory_writes':0,'powerpc_entry_bytes':'386000004e800020','pe':info(pe),'xex':info(xex),'synthxex_commit':'48d1453a55468aa2f8a211db0b20edd594ef5be3'}
+          open(out,'w').write(json.dumps(r,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(r,indent=2,sort_keys=True))
+          PY
+
+          (cd "$REL" && zip -9 XenonPerformance-v1.8.6-Executable-XEX.zip XenonPerformanceTest.xex FIRST_RUN.txt XPXEXTITLE1.json)
+          echo 'XPXEXTITLE1 PASS'
+
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.8.6-executable-xex-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build_xex_title/build.log
+            build_xex_title/XenonPerformanceTest.exe
+
+      - name: Upload executable XEX smoke bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.8.6-Executable-XEX
+          compression-level: 9
+          retention-days: 14
+          path: build_xex_title/release/
