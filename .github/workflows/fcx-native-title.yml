@@ -1,0 +1,321 @@
+name: Xenon Performance v1.9.0 FCX-native title
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fcx-native-title.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xenon-performance-v190-fcx-native
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build with real FreeChainXenon binutils
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Install host build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex texinfo git cmake ninja-build \
+            python3 zip ca-certificates zlib1g-dev
+
+      - name: Restore mini FCX binutils cache
+        id: fcx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/fcx-mini
+          key: fcx-mini-binutils-2.43.1-v1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build only the FCX assembler and PE linker
+        if: steps.fcx-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/fcx-build"
+          PREFIX="$HOME/fcx-mini"
+          SRC="$ROOT/binutils-gdb"
+          mkdir -p "$ROOT" "$PREFIX"
+
+          git clone --depth 1 --branch binutils-2.43.1 \
+            https://github.com/FreeChainXenon/binutils-gdb.git "$SRC"
+
+          mkdir "$ROOT/build-main"
+          cd "$ROOT/build-main"
+          "$SRC/configure" \
+            --target=powerpc64-fcx-xenon \
+            --prefix="$PREFIX" \
+            --disable-nls --disable-werror --disable-gdb --disable-sim \
+            --disable-gprofng
+          make -j"$(nproc)" all-binutils all-gas
+          make install-binutils install-gas
+
+          mkdir "$ROOT/build-pe"
+          cd "$ROOT/build-pe"
+          "$SRC/configure" \
+            --target=powerpc64-fcx-xenonpe \
+            --prefix="$PREFIX" \
+            --disable-nls --disable-werror --disable-gdb --disable-sim \
+            --disable-gprofng
+          make -j"$(nproc)" all-binutils all-ld
+          make install-binutils install-ld
+
+      - name: Build native Xbox PE and XEX
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/fcx-mini/bin:$PATH"
+          OUT="$GITHUB_WORKSPACE/build_fcx_native"
+          REL="$OUT/release"
+          SYNTH_SRC="$OUT/synthxex-src"
+          SYNTH_BUILD="$OUT/synthxex-build"
+          SYNTH_COMMIT="aee2b8c69a7843af32bb121cdde7722869094fcf"
+          mkdir -p "$OUT" "$REL"
+
+          command -v powerpc64-fcx-xenon-as
+          command -v powerpc64-fcx-xenon-objdump
+          command -v powerpc64-fcx-xenonpe-ld
+
+          cat > "$OUT/fcx_native_exit.s" <<'ASM'
+          # Xenon Performance v1.9.0
+          # Built with the same FreeChainXenon assembler/linker family used by FCX-Test.
+          # 32-bit ABI (-a32) with Xenon/PowerPC64 instructions (-mppc64).
+          # No NAND, flash, SMC, game-memory or title patch writes.
+
+          .set ORD_XEX_GET_MODULE_HANDLE, 0x195
+          .set ORD_XEX_UNLOAD_IMAGE_AND_EXIT_THREAD, 0x1A2
+
+          .section .data
+          .align 2
+          module_handle:
+              .long 0
+
+          .section .text
+          .global _start
+
+          # r4 = pointer to a little-endian PE32 field; returns value in r4.
+          read_le32:
+              li      r5, 24
+              lbz     r6, 3(r4)
+              slw     r6, r6, r5
+              subi    r5, r5, 8
+              lbz     r7, 2(r4)
+              slw     r7, r7, r5
+              or      r6, r6, r7
+              subi    r5, r5, 8
+              lbz     r7, 1(r4)
+              slw     r7, r7, r5
+              or      r6, r6, r7
+              lbz     r7, 0(r4)
+              or      r4, r6, r7
+              blr
+
+          # r3 = xboxkrnl ordinal; returns callable/export address in r3 or zero.
+          resolve_kernel_ordinal:
+              mflr    r12
+              mr      r8, r3
+
+              # Kernel PE base 0x80040000; PE header offset is stored at +0x3c.
+              lis     r4, 0x8004
+              ori     r4, r4, 0x003c
+              bl      read_le32
+              addis   r4, r4, 0x8004
+
+              # Export directory RVA from PE optional header data directory.
+              addi    r4, r4, 0x78
+              bl      read_le32
+              addis   r4, r4, 0x8004
+              mr      r9, r4
+
+              # NumberOfFunctions.
+              addi    r4, r9, 0x14
+              bl      read_le32
+              cmpw    r8, r4
+              bgt     ordinal_missing
+
+              # AddressOfFunctions table.
+              addi    r4, r9, 0x1c
+              bl      read_le32
+              addis   r4, r4, 0x8004
+
+              subi    r8, r8, 1
+              mulli   r8, r8, 4
+              add     r4, r4, r8
+              bl      read_le32
+              addis   r3, r4, 0x8004
+              mtlr    r12
+              blr
+
+          ordinal_missing:
+              li      r3, 0
+              mtlr    r12
+              blr
+
+          _start:
+              # FCX uses a 32-bit ABI on the 64-bit Xenon CPU. Keep a caller frame.
+              stwu    r1, -0x80(r1)
+
+              # Ask the kernel for the current executable module handle rather than
+              # reading the exported handle variable directly.
+              li      r3, ORD_XEX_GET_MODULE_HANDLE
+              bl      resolve_kernel_ordinal
+              cmpwi   r3, 0
+              beq     fail_closed
+              mtctr   r3
+              li      r3, 0
+              lis     r4, module_handle@ha
+              addi    r4, r4, module_handle@l
+              bctrl
+              cmpwi   r3, 0
+              bne     fail_closed
+
+              lis     r4, module_handle@ha
+              addi    r4, r4, module_handle@l
+              lwz     r30, 0(r4)
+              cmpwi   r30, 0
+              beq     fail_closed
+
+              # Cleanly terminate the current title thread/module.
+              li      r3, ORD_XEX_UNLOAD_IMAGE_AND_EXIT_THREAD
+              bl      resolve_kernel_ordinal
+              cmpwi   r3, 0
+              beq     fail_closed
+              mtctr   r3
+              mr      r3, r30
+              li      r4, 0
+              bctrl
+
+          # A resolver/API failure loops instead of returning through an invalid LR.
+          fail_closed:
+              b       fail_closed
+          ASM
+
+          # Use the exact FCX assembly mode used by the upstream FCX-Test project.
+          powerpc64-fcx-xenon-as \
+            -o "$OUT/fcx_native_exit.o" \
+            -mregnames -a32 -mppc64 "$OUT/fcx_native_exit.s"
+
+          powerpc64-fcx-xenon-objdump -dr "$OUT/fcx_native_exit.o" \
+            > "$REL/fcx_native_exit.disasm.txt"
+
+          # Use the real FreeChainXenon PE linker rather than an i386 PE wrapper.
+          powerpc64-fcx-xenonpe-ld \
+            --accept-unknown-input-arch \
+            --subsystem xbox \
+            --major-subsystem-version 1 --minor-subsystem-version 0 \
+            --major-os-version 0 --minor-os-version 0 \
+            --disable-dynamicbase \
+            --image-base 0x82000000 \
+            --section-alignment=0x10000 \
+            --disable-long-section-names \
+            -e _start \
+            -o "$OUT/XenonPerformanceFCXNative.exe" "$OUT/fcx_native_exit.o"
+
+          python3 - "$OUT/XenonPerformanceFCXNative.exe" <<'PY'
+          import struct,sys,hashlib
+          p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
+          if d[:2] != b'MZ': errors.append('MZ')
+          pe=struct.unpack_from('<I',d,0x3c)[0]
+          if d[pe:pe+4] != b'PE\0\0': errors.append('PE')
+          machine=struct.unpack_from('<H',d,pe+4)[0]
+          opt=pe+24
+          entry=struct.unpack_from('<I',d,opt+16)[0]
+          image=struct.unpack_from('<I',d,opt+28)[0]
+          align=struct.unpack_from('<I',d,opt+32)[0]
+          subsystem=struct.unpack_from('<H',d,opt+68)[0]
+          if image != 0x82000000: errors.append('image')
+          if align != 0x10000: errors.append('align')
+          if subsystem != 0x000e: errors.append('subsystem')
+          if not entry: errors.append('entry')
+          if errors: raise SystemExit('XPFCXPE1 FAIL '+','.join(errors))
+          print('XPFCXPE1 PASS machine=0x%04x entry=0x%08x sha256=%s' %
+                (machine,entry,hashlib.sha256(d).hexdigest()))
+          PY
+
+          git init -q "$SYNTH_SRC"
+          git -C "$SYNTH_SRC" remote add origin https://github.com/FreeChainXenon/SynthXEX.git
+          git -C "$SYNTH_SRC" fetch -q --depth 1 origin "$SYNTH_COMMIT"
+          git -C "$SYNTH_SRC" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SYNTH_SRC" rev-parse HEAD)" = "$SYNTH_COMMIT"
+          cmake -S "$SYNTH_SRC" -B "$SYNTH_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$SYNTH_BUILD" --parallel 4
+
+          # FCX-Test itself uses --skip-machine-check with the FCX PE linker.
+          "$SYNTH_BUILD/synthxex" \
+            --skip-machine-check \
+            --input "$OUT/XenonPerformanceFCXNative.exe" \
+            --output "$REL/XenonPerformanceFCXNative.xex" \
+            --type title
+
+          python3 - "$REL/XenonPerformanceFCXNative.xex" <<'PY'
+          import struct,sys,hashlib
+          p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
+          if len(d)<256: errors.append('size')
+          if d[:4] != b'XEX2': errors.append('XEX2')
+          if not errors:
+              flags,peoff,res,secoff,count=struct.unpack('>IIIII',d[4:24])
+              if not (flags & 1): errors.append('TITLE')
+              if flags & 8: errors.append('DLL')
+              if 24+count*8>len(d): errors.append('headers')
+              ids=[struct.unpack('>II',d[24+i*8:32+i*8])[0] for i in range(count)] if not errors else []
+              if 0x00010100 not in ids: errors.append('entry_header')
+          if errors: raise SystemExit('XPFCXXEX1 FAIL '+','.join(errors))
+          print('XPFCXXEX1 PASS size=%d sha256=%s'%(len(d),hashlib.sha256(d).hexdigest()))
+          PY
+
+          cat > "$REL/README_FIRST_RUN.txt" <<'TXT'
+          XENON PERFORMANCE v1.9.0 — FREECHAINXENON NATIVE TITLE TEST
+
+          This build abandons the synthetic i386-PE wrapper used by v1.8.6-v1.8.9.
+          The PowerPC object and Xbox PE are produced by FreeChainXenon's own assembler
+          and PE linker using the same -a32 -mppc64 / xenonpe flow as FCX-Test.
+
+          Runtime behavior:
+          - resolve XexGetModuleHandle (0x195);
+          - request the current executable handle;
+          - resolve XexUnloadImageAndExitThread (0x1A2);
+          - exit the title cleanly;
+          - no NAND/flash, SMC, game-memory or optimization writes.
+
+          Test once from Aurora/XeXMenu. Do NOT install as a DashLaunch plugin.
+          PASS: returns to Aurora without Fatal Crash, reboot or freeze.
+          FAIL: stop and report the exact behavior.
+          TXT
+
+          python3 - "$OUT/XenonPerformanceFCXNative.exe" "$REL/XenonPerformanceFCXNative.xex" "$REL/XPFCX1.json" <<'PY'
+          import sys,hashlib,json,os,struct
+          pe,xex,out=sys.argv[1:]
+          pd=open(pe,'rb').read(); xd=open(xex,'rb').read(); po=struct.unpack_from('<I',pd,0x3c)[0]
+          r={
+            'schema':'XPFCX1','version':'1.9.0','writes':0,
+            'toolchain':'FreeChainXenon binutils-2.43.1 minimal gas+ld',
+            'synthxex_commit':'aee2b8c69a7843af32bb121cdde7722869094fcf',
+            'pe_machine':'0x%04X'%struct.unpack_from('<H',pd,po+4)[0],
+            'pe':{'size':len(pd),'sha256':hashlib.sha256(pd).hexdigest()},
+            'xex':{'name':os.path.basename(xex),'size':len(xd),'sha256':hashlib.sha256(xd).hexdigest()}
+          }
+          open(out,'w').write(json.dumps(r,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(r,indent=2,sort_keys=True))
+          PY
+
+          cp "$OUT/XenonPerformanceFCXNative.exe" "$REL/"
+          (cd "$REL" && zip -9 XenonPerformance-v1.9.0-FCX-Native.zip \
+            XenonPerformanceFCXNative.xex XenonPerformanceFCXNative.exe \
+            README_FIRST_RUN.txt XPFCX1.json fcx_native_exit.disasm.txt)
+
+      - name: Upload FCX native bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.9.0-FCX-Native
+          retention-days: 14
+          compression-level: 9
+          path: build_fcx_native/release/
