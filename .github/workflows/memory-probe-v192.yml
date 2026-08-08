@@ -1,0 +1,236 @@
+name: Xenon Performance v1.9.2 strict memory probe DLL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/xp_memory_probe_v192.s'
+      - '.github/workflows/memory-probe-v192.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xenon-performance-v192-memory-probe
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build strict POWERPCBE 32-bit ABI memory probe DLL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fast host build set
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils binutils-powerpc-linux-gnu \
+            cmake ninja-build git python3 ca-certificates zip
+
+      - name: Build v1.9.2 memory probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build_memory_v192"
+          SYNTH_SRC="$OUT/synthxex-src"
+          SYNTH_BUILD="$OUT/synthxex-build"
+          REL="$OUT/release"
+          LOG="$OUT/build.log"
+          SYNTH_COMMIT="48d1453a55468aa2f8a211db0b20edd594ef5be3"
+          mkdir -p "$OUT" "$REL"
+          : > "$LOG"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo 'XPMEM192 stage=source-gates begin'
+          grep -q 'ORD_MM_QUERY_STATISTICS' src/xp_memory_probe_v192.s
+          grep -q 'stwu' src/xp_memory_probe_v192.s
+          ! grep -Eq '\bstdu\b|\bstd\b|\bld\b|\bclrldi\b' src/xp_memory_probe_v192.s
+          ! grep -q 'XNotifyQueueUI' src/xp_memory_probe_v192.s
+          ! grep -q 'HalSendSMCMessage' src/xp_memory_probe_v192.s
+          ! grep -q 'MmSetAddressProtect' src/xp_memory_probe_v192.s
+          echo 'XPMEM192 stage=source-gates pass'
+
+          echo 'XPMEM192 stage=ppc begin'
+          powerpc-linux-gnu-as -mregnames -mppc64 \
+            src/xp_memory_probe_v192.s -o "$OUT/xp_memory_probe_v192.o"
+
+          powerpc-linux-gnu-ld \
+            -Ttext=0x82010000 -e _start \
+            -o "$OUT/xp_memory_probe_v192.elf" \
+            "$OUT/xp_memory_probe_v192.o"
+
+          powerpc-linux-gnu-objcopy -O binary -j .text \
+            "$OUT/xp_memory_probe_v192.elf" "$OUT/xp_memory_probe_v192.bin"
+          powerpc-linux-gnu-objdump -dr "$OUT/xp_memory_probe_v192.elf" \
+            > "$REL/xp_memory_probe_v192.disasm.txt"
+          test -s "$OUT/xp_memory_probe_v192.bin"
+          grep -q '<_start>' "$REL/xp_memory_probe_v192.disasm.txt"
+          grep -q '<get_kernel_export>' "$REL/xp_memory_probe_v192.disasm.txt"
+          grep -q 'stwu' "$REL/xp_memory_probe_v192.disasm.txt"
+          ! grep -Eq '\bstdu\b|\bclrldi\b' "$REL/xp_memory_probe_v192.disasm.txt"
+          echo 'XPMEM192 stage=ppc pass'
+
+          printf '.section .text\n.globl _start\n_start:\n.incbin "%s"\n' \
+            "$OUT/xp_memory_probe_v192.bin" > "$OUT/wrapper.s"
+          as --32 "$OUT/wrapper.s" -o "$OUT/wrapper.o"
+          ld -mi386pe --dll --subsystem 14 \
+            --major-subsystem-version 1 --minor-subsystem-version 0 \
+            --major-os-version 0 --minor-os-version 0 \
+            --disable-dynamicbase --image-base 0x82000000 \
+            --section-alignment 0x10000 --file-alignment 0x200 \
+            --disable-long-section-names -e _start \
+            -o "$OUT/XenonPerformanceMemoryProbe.exe" "$OUT/wrapper.o"
+
+          python3 - "$OUT/XenonPerformanceMemoryProbe.exe" "$OUT/xp_memory_probe_v192.bin" <<'PY'
+          import hashlib,struct,sys
+          pe_path, raw_path = sys.argv[1:]
+          d = bytearray(open(pe_path,'rb').read())
+          raw = open(raw_path,'rb').read()
+          errors=[]
+          if d[:2] != b'MZ': errors.append('MZ')
+          pe=struct.unpack_from('<I',d,0x3c)[0]
+          if d[pe:pe+4] != b'PE\0\0': errors.append('PE')
+          old=struct.unpack_from('<H',d,pe+4)[0]
+          if old != 0x014c: errors.append(f'pre-machine=0x{old:04x}')
+          struct.pack_into('<H',d,pe+4,0x01F2)
+          open(pe_path,'wb').write(d)
+
+          machine=struct.unpack_from('<H',d,pe+4)[0]
+          nsec=struct.unpack_from('<H',d,pe+6)[0]
+          optsz=struct.unpack_from('<H',d,pe+20)[0]
+          chars=struct.unpack_from('<H',d,pe+22)[0]
+          opt=pe+24
+          entry=struct.unpack_from('<I',d,opt+16)[0]
+          base=struct.unpack_from('<I',d,opt+28)[0]
+          align=struct.unpack_from('<I',d,opt+32)[0]
+          subsystem=struct.unpack_from('<H',d,opt+68)[0]
+          if machine != 0x01F2: errors.append('machine')
+          if not (chars & 0x2000): errors.append('not-dll')
+          if subsystem != 0x000E: errors.append('subsystem')
+          if base != 0x82000000: errors.append('image-base')
+          if align != 0x10000: errors.append('alignment')
+          if base + entry != 0x82010000: errors.append(f'text-va=0x{base+entry:08x}')
+          st=opt+optsz; found=False
+          for i in range(nsec):
+              s=st+i*40
+              vs,va,rs,rp=struct.unpack_from('<IIII',d,s+8)
+              if va <= entry < va+max(vs,rs):
+                  found=True
+                  pos=rp+(entry-va)
+                  if d[pos:pos+len(raw)] != raw: errors.append('payload-mismatch')
+          if not found: errors.append('entry-map')
+          if errors: raise SystemExit('XPPEMEM192 FAIL '+','.join(errors))
+          print('XPPEMEM192 PASS machine=POWERPCBE sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          echo 'XPMEM192 stage=synthxex begin'
+          git init -q "$SYNTH_SRC"
+          git -C "$SYNTH_SRC" remote add origin https://github.com/OpenXeChain/SynthXEX.git
+          git -C "$SYNTH_SRC" fetch -q --depth 1 origin "$SYNTH_COMMIT"
+          git -C "$SYNTH_SRC" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SYNTH_SRC" rev-parse HEAD)" = "$SYNTH_COMMIT"
+          cmake -S "$SYNTH_SRC" -B "$SYNTH_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$SYNTH_BUILD" --parallel 4
+
+          # Strict architecture validation, same outer DLL format that passed the hardware smoke.
+          "$SYNTH_BUILD/synthxex" \
+            --input "$OUT/XenonPerformanceMemoryProbe.exe" \
+            --output "$REL/XenonPerformanceMemoryProbe-v1.9.2.xex" \
+            --type dll
+
+          python3 - "$REL/XenonPerformanceMemoryProbe-v1.9.2.xex" <<'PY'
+          import hashlib,struct,sys
+          p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
+          if d[:4] != b'XEX2': errors.append('XEX2')
+          if len(d) < 256: errors.append('size')
+          if not errors:
+              flags,peoff,res,secoff,count=struct.unpack('>IIIII',d[4:24])
+              if flags != 0x8: errors.append(f'moduleFlags=0x{flags:x}')
+              ids=[struct.unpack('>II',d[24+i*8:32+i*8])[0] for i in range(count)]
+              if 0x00010100 not in ids: errors.append('entry-header')
+              if peoff >= len(d): errors.append('pe-offset')
+              pe=d[peoff:]
+              po=struct.unpack_from('<I',pe,0x3c)[0]
+              machine=struct.unpack_from('<H',pe,po+4)[0]
+              if machine != 0x01F2: errors.append(f'embedded-machine=0x{machine:04x}')
+          if errors: raise SystemExit('XPXEXMEM192 FAIL '+','.join(errors))
+          print('XPXEXMEM192 PASS sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          cat > "$REL/README_FIRST_RUN.txt" <<'TXT'
+          XENON PERFORMANCE v1.9.2 — STRICT MEMORY PROBE DLL
+
+          This is NOT a standalone title. It deliberately uses the resident DLL form.
+          It performs one read-only hardware gate on DLL_PROCESS_ATTACH:
+            - resolve xboxkrnl MmQueryStatistics (ordinal 198)
+            - query the 104-byte MM_STATISTICS block
+            - validate TotalPhysicalPages and TitleAvailablePages
+            - return TRUE only if the probe is sane
+
+          Important corrections from v1.9.1:
+            - 32-bit ABI stack frame (stwu/stw/lwz), not stdu/std/ld
+            - no zero-extension of 0x8004xxxx kernel addresses
+            - no XNotifyQueueUI call from the DLL loader thread
+            - strict POWERPCBE PE machine (0x01F2)
+            - SynthXEX machine check remains ENABLED
+
+          No NAND, flash, SMC, game-memory, filesystem or optimization writes.
+          TXT
+
+          python3 - "$REL/XenonPerformanceMemoryProbe-v1.9.2.xex" "$REL/XP_MEMORY_192.json" <<'PY'
+          import hashlib,json,os,sys
+          p,o=sys.argv[1:]
+          d=open(p,'rb').read()
+          report={
+            'schema':'XP_MEMORY_192',
+            'version':'1.9.2',
+            'architecture':'resident DLL / strict POWERPCBE',
+            'abi':'32-bit caller frame on Xenon',
+            'purpose':'read-only MmQueryStatistics hardware gate',
+            'hardware_writes_enabled':False,
+            'writes':0,
+            'xnotify_in_loader_thread':False,
+            'kernel_address_zero_extension':False,
+            'synthxex_skip_machine_check':False,
+            'xex':{'name':os.path.basename(p),'size':len(d),'sha256':hashlib.sha256(d).hexdigest()}
+          }
+          open(o,'w').write(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(report,indent=2,sort_keys=True))
+          PY
+
+          cp "$OUT/XenonPerformanceMemoryProbe.exe" "$REL/"
+          cp src/xp_memory_probe_v192.s "$REL/"
+          (cd "$REL" && sha256sum * > SHA256SUMS.txt)
+          (cd "$REL" && zip -9 XenonPerformance-v1.9.2-Memory-Probe.zip \
+            XenonPerformanceMemoryProbe-v1.9.2.xex XenonPerformanceMemoryProbe.exe \
+            xp_memory_probe_v192.s xp_memory_probe_v192.disasm.txt \
+            README_FIRST_RUN.txt XP_MEMORY_192.json SHA256SUMS.txt)
+          echo 'XPMEM192 PASS'
+
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.9.2-memory-probe-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build_memory_v192/build.log
+            build_memory_v192/xp_memory_probe_v192.elf
+            build_memory_v192/xp_memory_probe_v192.bin
+            build_memory_v192/release/xp_memory_probe_v192.disasm.txt
+            build_memory_v192/XenonPerformanceMemoryProbe.exe
+
+      - name: Upload v1.9.2 memory probe bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.9.2-Memory-Probe
+          compression-level: 9
+          retention-days: 14
+          path: build_memory_v192/release/
