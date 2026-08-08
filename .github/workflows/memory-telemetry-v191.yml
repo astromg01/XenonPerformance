@@ -1,0 +1,252 @@
+name: Xenon Performance v1.9.1 hardware memory telemetry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/xp_memory_telemetry_ppc.s'
+      - '.github/workflows/memory-telemetry-v191.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xenon-performance-v191-memory-telemetry
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build read-only memory telemetry DLL XEX
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fast host build set
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils binutils-powerpc-linux-gnu \
+            cmake ninja-build git python3 ca-certificates zip
+
+      - name: Build PowerPC telemetry payload and strict XEX
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build_memory_v191"
+          SYNTH_SRC="$OUT/synthxex-src"
+          SYNTH_BUILD="$OUT/synthxex-build"
+          REL="$OUT/release"
+          LOG="$OUT/build.log"
+          SYNTH_COMMIT="48d1453a55468aa2f8a211db0b20edd594ef5be3"
+          mkdir -p "$OUT" "$REL"
+          : > "$LOG"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo 'XPMEM191 stage=source-gates begin'
+          grep -q 'ORD_MM_QUERY_STATISTICS' src/xp_memory_telemetry_ppc.s
+          grep -q 'XAM_ORD_CURRENT_TITLE_ID' src/xp_memory_telemetry_ppc.s
+          grep -q 'XAM_ORD_NOTIFY_QUEUE_UI' src/xp_memory_telemetry_ppc.s
+          ! grep -q 'HalSendSMCMessage' src/xp_memory_telemetry_ppc.s
+          ! grep -q 'MmSetAddressProtect' src/xp_memory_telemetry_ppc.s
+          ! grep -q 'NtWriteFile' src/xp_memory_telemetry_ppc.s
+          echo 'XPMEM191 stage=source-gates pass'
+
+          echo 'XPMEM191 stage=ppc begin'
+          powerpc-linux-gnu-as -mregnames -mppc64 \
+            src/xp_memory_telemetry_ppc.s -o "$OUT/xp_memory_telemetry_ppc.o"
+
+          # Resolve local-label relocations against the exact PE .text VA.
+          powerpc-linux-gnu-ld \
+            -Ttext=0x82010000 -e _start \
+            -o "$OUT/xp_memory_telemetry_ppc.elf" \
+            "$OUT/xp_memory_telemetry_ppc.o"
+
+          powerpc-linux-gnu-objcopy -O binary -j .text \
+            "$OUT/xp_memory_telemetry_ppc.elf" "$OUT/xp_memory_telemetry_ppc.bin"
+          powerpc-linux-gnu-objdump -dr "$OUT/xp_memory_telemetry_ppc.elf" \
+            > "$REL/xp_memory_telemetry_ppc.disasm.txt"
+          test -s "$OUT/xp_memory_telemetry_ppc.bin"
+          grep -q '<_start>' "$REL/xp_memory_telemetry_ppc.disasm.txt"
+          grep -q '<get_kernel_export>' "$REL/xp_memory_telemetry_ppc.disasm.txt"
+          grep -q '<append_hex32>' "$REL/xp_memory_telemetry_ppc.disasm.txt"
+          echo 'XPMEM191 stage=ppc pass'
+
+          # The host PE linker gives us a deterministic PE/Xbox layout. Its .text
+          # is replaced by the already-linked Xenon payload; the machine field is
+          # then corrected to IMAGE_FILE_MACHINE_POWERPCBE before SynthXEX sees it.
+          printf '.section .text\n.globl _start\n_start:\n.incbin "%s"\n' \
+            "$OUT/xp_memory_telemetry_ppc.bin" > "$OUT/wrapper.s"
+          as --32 "$OUT/wrapper.s" -o "$OUT/wrapper.o"
+          ld -mi386pe --dll --subsystem 14 \
+            --major-subsystem-version 1 --minor-subsystem-version 0 \
+            --major-os-version 0 --minor-os-version 0 \
+            --disable-dynamicbase --image-base 0x82000000 \
+            --section-alignment 0x10000 --file-alignment 0x200 \
+            --disable-long-section-names -e _start \
+            -o "$OUT/XenonPerformanceMemoryTelemetry.exe" "$OUT/wrapper.o"
+
+          python3 - "$OUT/XenonPerformanceMemoryTelemetry.exe" "$OUT/xp_memory_telemetry_ppc.bin" <<'PY'
+          import hashlib,struct,sys
+          pe_path, raw_path = sys.argv[1:]
+          d = bytearray(open(pe_path,'rb').read())
+          raw = open(raw_path,'rb').read()
+          errors=[]
+          if d[:2] != b'MZ': errors.append('MZ')
+          pe = struct.unpack_from('<I',d,0x3c)[0]
+          if d[pe:pe+4] != b'PE\0\0': errors.append('PE')
+          old_machine=struct.unpack_from('<H',d,pe+4)[0]
+          if old_machine != 0x014c: errors.append(f'pre-machine=0x{old_machine:04x}')
+          struct.pack_into('<H',d,pe+4,0x01F2)
+          open(pe_path,'wb').write(d)
+
+          machine=struct.unpack_from('<H',d,pe+4)[0]
+          nsec=struct.unpack_from('<H',d,pe+6)[0]
+          optsz=struct.unpack_from('<H',d,pe+20)[0]
+          chars=struct.unpack_from('<H',d,pe+22)[0]
+          opt=pe+24
+          entry=struct.unpack_from('<I',d,opt+16)[0]
+          base=struct.unpack_from('<I',d,opt+28)[0]
+          align=struct.unpack_from('<I',d,opt+32)[0]
+          subsystem=struct.unpack_from('<H',d,opt+68)[0]
+          if machine != 0x01F2: errors.append('machine')
+          if not (chars & 0x2000): errors.append('not-dll')
+          if subsystem != 0x000E: errors.append('subsystem')
+          if base != 0x82000000: errors.append('image-base')
+          if align != 0x10000: errors.append('alignment')
+          if base + entry != 0x82010000: errors.append(f'text-va=0x{base+entry:08x}')
+          st=opt+optsz; found=False
+          for i in range(nsec):
+              s=st+i*40
+              vs,va,rs,rp=struct.unpack_from('<IIII',d,s+8)
+              if va <= entry < va+max(vs,rs):
+                  found=True
+                  pos=rp+(entry-va)
+                  if d[pos:pos+len(raw)] != raw: errors.append('payload-mismatch')
+          if not found: errors.append('entry-map')
+          if errors: raise SystemExit('XPPEMEM191 FAIL '+','.join(errors))
+          print('XPPEMEM191 PASS machine=POWERPCBE text_va=0x82010000 sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          echo 'XPMEM191 stage=synthxex begin'
+          git init -q "$SYNTH_SRC"
+          git -C "$SYNTH_SRC" remote add origin https://github.com/OpenXeChain/SynthXEX.git
+          git -C "$SYNTH_SRC" fetch -q --depth 1 origin "$SYNTH_COMMIT"
+          git -C "$SYNTH_SRC" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SYNTH_SRC" rev-parse HEAD)" = "$SYNTH_COMMIT"
+          cmake -S "$SYNTH_SRC" -B "$SYNTH_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$SYNTH_BUILD" --parallel 4
+          test -x "$SYNTH_BUILD/synthxex"
+
+          # Strict path: architecture check remains enabled.
+          "$SYNTH_BUILD/synthxex" \
+            --input "$OUT/XenonPerformanceMemoryTelemetry.exe" \
+            --output "$REL/XenonPerformanceMemoryTelemetry-v1.9.1.xex" \
+            --type dll
+
+          python3 - "$REL/XenonPerformanceMemoryTelemetry-v1.9.1.xex" <<'PY'
+          import hashlib,struct,sys
+          p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
+          if d[:4] != b'XEX2': errors.append('XEX2')
+          if len(d) < 256: errors.append('size')
+          if not errors:
+              flags,peoff,res,secoff,count=struct.unpack('>IIIII',d[4:24])
+              if not (flags & 8): errors.append('DLL-flag')
+              ids=[struct.unpack('>II',d[24+i*8:32+i*8])[0] for i in range(count)]
+              if 0x00010100 not in ids: errors.append('entry-header')
+              if peoff and peoff >= len(d): errors.append('pe-offset')
+              if secoff and secoff >= len(d): errors.append('security-offset')
+          if errors: raise SystemExit('XPXEXMEM191 FAIL '+','.join(errors))
+          print('XPXEXMEM191 PASS sha256='+hashlib.sha256(d).hexdigest())
+          PY
+
+          cat > "$REL/README_FIRST_RUN.txt" <<'TXT'
+          XENON PERFORMANCE v1.9.1 — HARDWARE MEMORY TELEMETRY
+
+          Read-only milestone. This build does NOT apply optimization writes.
+          It attempts to read:
+            - MmQueryStatistics / TotalPhysicalPages
+            - MmQueryStatistics / TitleAvailablePages
+            - XamGetCurrentTitleId
+          and queues one visible Xbox notification:
+
+            XP1.9.1 TID=XXXXXXXX TA=XXXXXXXX TP=XXXXXXXX
+
+          TID = current Title ID (hex)
+          TA  = TitleAvailablePages (hex)
+          TP  = TotalPhysicalPages (hex)
+
+          Test once from the same XeXMenu path that passed v1.8.6.
+          Do NOT install permanently in launch.ini yet.
+          PASS = no Fatal Crash/reboot and a notification appears.
+          If it returns safely but no notification appears, report that exact result.
+          TXT
+
+          python3 - "$REL/XenonPerformanceMemoryTelemetry-v1.9.1.xex" "$REL/XP_MEMORY_191.json" <<'PY'
+          import hashlib,json,os,sys
+          p,o=sys.argv[1:]
+          d=open(p,'rb').read()
+          report={
+            'schema':'XP_MEMORY_191',
+            'version':'1.9.1',
+            'purpose':'read-only hardware memory telemetry and visible notification',
+            'hardware_writes_enabled':False,
+            'writes':0,
+            'nand_flash_writes':0,
+            'game_memory_writes':0,
+            'smc_writes':0,
+            'kernel_ordinals':{
+              'MmQueryStatistics':198,
+              'XexGetModuleHandle':405,
+              'XexGetProcedureAddress':407
+            },
+            'xam_ordinals':{
+              'XamGetCurrentTitleId':463,
+              'XNotifyQueueUI':656
+            },
+            'pe_machine':'0x01F2 POWERPCBE',
+            'skip_machine_check':False,
+            'xex':{
+              'name':os.path.basename(p),
+              'size':len(d),
+              'sha256':hashlib.sha256(d).hexdigest()
+            }
+          }
+          open(o,'w').write(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(report,indent=2,sort_keys=True))
+          PY
+
+          cp "$OUT/XenonPerformanceMemoryTelemetry.exe" "$REL/"
+          cp src/xp_memory_telemetry_ppc.s "$REL/"
+          (cd "$REL" && zip -9 XenonPerformance-v1.9.1-Memory-Telemetry.zip \
+            XenonPerformanceMemoryTelemetry-v1.9.1.xex \
+            XenonPerformanceMemoryTelemetry.exe \
+            xp_memory_telemetry_ppc.s xp_memory_telemetry_ppc.disasm.txt \
+            README_FIRST_RUN.txt XP_MEMORY_191.json)
+          echo 'XPMEM191 PASS'
+
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.9.1-memory-telemetry-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build_memory_v191/build.log
+            build_memory_v191/xp_memory_telemetry_ppc.elf
+            build_memory_v191/xp_memory_telemetry_ppc.bin
+            build_memory_v191/release/xp_memory_telemetry_ppc.disasm.txt
+            build_memory_v191/XenonPerformanceMemoryTelemetry.exe
+
+      - name: Upload v1.9.1 telemetry bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenonPerformance-v1.9.1-Memory-Telemetry
+          compression-level: 9
+          retention-days: 14
+          path: build_memory_v191/release/
