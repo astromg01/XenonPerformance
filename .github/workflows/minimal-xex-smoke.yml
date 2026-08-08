@@ -1,4 +1,4 @@
-name: Xenon Performance v1.8.5 minimal XEX smoke
+name: Xenon Performance v1.8.6 strict PowerPCBE XEX smoke
 
 on:
   push:
@@ -11,12 +11,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: xenon-performance-v185-minimal-xex
+  group: xenon-performance-v186-strict-xex
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build inert Xbox 360 DLL XEX
+    name: Build strict PowerPCBE inert Xbox 360 DLL XEX
     runs-on: ubuntu-24.04
     timeout-minutes: 12
 
@@ -27,7 +27,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential binutils cmake ninja-build git python3 ca-certificates zip
 
-      - name: Build PE wrapper and SynthXEX
+      - name: Build strict PowerPCBE PE wrapper and SynthXEX
         shell: bash
         run: |
           set -euo pipefail
@@ -39,10 +39,9 @@ jobs:
           COMMIT="48d1453a55468aa2f8a211db0b20edd594ef5be3"
           mkdir -p "$OUT" "$REL"
           : > "$LOG"
-
           exec > >(tee -a "$LOG") 2>&1
-          echo 'XPXEXSMOKE1 stage=pe begin'
 
+          echo 'XPXEXSMOKE2 stage=pe begin'
           cat > "$OUT/ppc_dll_stub.s" <<'ASM'
           .section .text
           .globl _start
@@ -60,6 +59,22 @@ jobs:
             --disable-long-section-names -e _start \
             -o "$OUT/XenonPerformanceSmokePlugin.exe" "$OUT/ppc_dll_stub.o"
 
+          # GNU's host PE linker stamps IMAGE_FILE_MACHINE_I386. The payload is
+          # deliberately raw Xenon/PowerPC code, so correct the COFF Machine field
+          # to IMAGE_FILE_MACHINE_POWERPCBE (0x01F2) before SynthXEX validation.
+          python3 - "$OUT/XenonPerformanceSmokePlugin.exe" <<'PY'
+          import struct,sys
+          p=sys.argv[1]
+          d=bytearray(open(p,'rb').read())
+          pe=struct.unpack_from('<I',d,0x3c)[0]
+          if d[pe:pe+4] != b'PE\0\0': raise SystemExit('XPMACHINE1 FAIL missing PE')
+          old=struct.unpack_from('<H',d,pe+4)[0]
+          if old != 0x014c: raise SystemExit(f'XPMACHINE1 FAIL unexpected machine 0x{old:04x}')
+          struct.pack_into('<H',d,pe+4,0x01F2)
+          open(p,'wb').write(d)
+          print('XPMACHINE1 PASS i386->POWERPCBE')
+          PY
+
           python3 - "$OUT/XenonPerformanceSmokePlugin.exe" <<'PY'
           import struct,sys,hashlib
           p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
@@ -75,7 +90,7 @@ jobs:
           base=struct.unpack_from('<I',d,opt+28)[0]
           align=struct.unpack_from('<I',d,opt+32)[0]
           subsystem=struct.unpack_from('<H',d,opt+68)[0]
-          if machine != 0x14c: errors.append('machine')
+          if machine != 0x01F2: errors.append(f'machine=0x{machine:04x}')
           if not (chars & 0x2000): errors.append('not DLL')
           if subsystem != 0x000e: errors.append('not Xbox subsystem')
           if base != 0x82000000: errors.append('image base')
@@ -88,31 +103,30 @@ jobs:
                   pos=rp+(entry-va); code=d[pos:pos+8]; found=True
                   if code != bytes.fromhex('386000014e800020'): errors.append('entry bytes')
           if not found: errors.append('entry mapping')
-          if errors: raise SystemExit('XPPESTUB1 FAIL: '+', '.join(errors))
-          print('XPPESTUB1 PASS sha256='+hashlib.sha256(d).hexdigest())
+          if errors: raise SystemExit('XPPESTUB2 FAIL: '+', '.join(errors))
+          print('XPPESTUB2 PASS machine=POWERPCBE sha256='+hashlib.sha256(d).hexdigest())
           PY
-
-          echo 'XPXEXSMOKE1 stage=pe pass'
 
           git init -q "$SRC"
           git -C "$SRC" remote add origin https://github.com/OpenXeChain/SynthXEX.git
           git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
           git -C "$SRC" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
           test "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT"
-          echo "XPXEXSMOKE1 stage=synthxex_source pass commit=$COMMIT"
+          echo "XPXEXSMOKE2 stage=synthxex_source pass commit=$COMMIT"
 
           cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build "$BUILD" --parallel 4
           test -x "$BUILD/synthxex"
-          echo 'XPXEXSMOKE1 stage=synthxex_host pass'
+          echo 'XPXEXSMOKE2 stage=synthxex_host pass'
 
-          "$BUILD/synthxex" --skip-machine-check \
+          # Strict path: no --skip-machine-check.
+          "$BUILD/synthxex" \
             --input "$OUT/XenonPerformanceSmokePlugin.exe" \
-            --output "$REL/XenonPerformanceSmokePlugin.xex" \
+            --output "$REL/XenonPerformanceSmokePlugin-v1.8.6.xex" \
             --type dll
 
-          python3 - "$REL/XenonPerformanceSmokePlugin.xex" <<'PY'
-          import struct,sys,hashlib,json,os
+          python3 - "$REL/XenonPerformanceSmokePlugin-v1.8.6.xex" <<'PY'
+          import struct,sys,hashlib
           p=sys.argv[1]; d=open(p,'rb').read(); errors=[]
           if len(d) < 256: errors.append('too small')
           if d[:4] != b'XEX2': errors.append('missing XEX2')
@@ -126,53 +140,53 @@ jobs:
                   if 0x00010100 not in ids: errors.append('entry header missing')
               if peoff and peoff >= len(d): errors.append('PE offset outside file')
               if secoff and secoff >= len(d): errors.append('security offset outside file')
-          if errors: raise SystemExit('XPXEXSTUB1 FAIL: '+', '.join(errors))
-          print('XPXEXSTUB1 PASS sha256='+hashlib.sha256(d).hexdigest())
+          if errors: raise SystemExit('XPXEXSTUB2 FAIL: '+', '.join(errors))
+          print('XPXEXSTUB2 PASS sha256='+hashlib.sha256(d).hexdigest())
           PY
 
-          cat > "$REL/SMOKE_FIRST_RUN.txt" <<'TXT'
-          XENON PERFORMANCE v1.8.5 — MINIMAL RESIDENT XEX SMOKE TEST
+          cat > "$REL/SMOKE_FIRST_RUN_v1.8.6.txt" <<'TXT'
+          XENON PERFORMANCE v1.8.6 — STRICT POWERPCBE RESIDENT XEX SMOKE
 
-          This XEX is intentionally inert. It only returns TRUE from the PowerPC DLL entry point.
-          It performs no game patches, no memory writes, no SMC writes, no NAND/flash writes and no optimization logic.
+          Changes from v1.8.5:
+          - PE COFF Machine is POWERPCBE (0x01F2), not i386.
+          - SynthXEX machine validation is enabled; --skip-machine-check is NOT used.
+          - Entry remains inert: li r3,1 ; blr.
+          - No game-memory, SMC, NAND/flash, filesystem or optimization writes.
 
-          FIRST TEST:
-          - Do not configure it as a permanent boot plugin.
-          - Load XenonPerformanceSmokePlugin.xex once using an already-working temporary/one-shot module loader.
-          - PASS means no fatal error, dashboard crash, reset or hang.
-          - If there is an XEX/header/import error, keep the exact message or photo.
+          Do not install permanently at boot yet. This remains a hardware-load smoke test.
           TXT
 
-          python3 - "$OUT/XenonPerformanceSmokePlugin.exe" "$REL/XenonPerformanceSmokePlugin.xex" "$REL/XPXEXSMOKE1.json" <<'PY'
-          import sys,hashlib,json,os
+          python3 - "$OUT/XenonPerformanceSmokePlugin.exe" "$REL/XenonPerformanceSmokePlugin-v1.8.6.xex" "$REL/XPXEXSMOKE2.json" <<'PY'
+          import sys,hashlib,json,os,struct
           pe,xex,out=sys.argv[1:]
           def info(p):
               d=open(p,'rb').read(); return {'name':os.path.basename(p),'size':len(d),'sha256':hashlib.sha256(d).hexdigest()}
-          r={'schema':'XPXEXSMOKE1','version':'1.8.5','purpose':'inert resident DLL XEX load smoke test only','writes':0,'nand_flash_writes':0,'game_memory_writes':0,'powerpc_entry_bytes':'386000014e800020','pe':info(pe),'xex':info(xex),'synthxex_commit':'48d1453a55468aa2f8a211db0b20edd594ef5be3'}
+          d=open(pe,'rb').read(); off=struct.unpack_from('<I',d,0x3c)[0]
+          r={'schema':'XPXEXSMOKE2','version':'1.8.6','purpose':'strict POWERPCBE inert resident DLL XEX load smoke test','writes':0,'machine':'0x01F2 POWERPCBE','synthxex_skip_machine_check':False,'powerpc_entry_bytes':'386000014e800020','pe':info(pe),'xex':info(xex),'synthxex_commit':'48d1453a55468aa2f8a211db0b20edd594ef5be3'}
           open(out,'w').write(json.dumps(r,indent=2,sort_keys=True)+'\n')
           print(json.dumps(r,indent=2,sort_keys=True))
           PY
 
-          cp "$OUT/XenonPerformanceSmokePlugin.exe" "$REL/"
-          (cd "$REL" && zip -9 XenonPerformance-v1.8.5-Minimal-XEX.zip XenonPerformanceSmokePlugin.xex XenonPerformanceSmokePlugin.exe SMOKE_FIRST_RUN.txt XPXEXSMOKE1.json)
-          echo 'XPXEXSMOKE1 PASS'
+          cp "$OUT/XenonPerformanceSmokePlugin.exe" "$REL/XenonPerformanceSmokePlugin-v1.8.6.exe"
+          (cd "$REL" && zip -9 XenonPerformance-v1.8.6-Strict-PowerPCBE-XEX.zip XenonPerformanceSmokePlugin-v1.8.6.xex XenonPerformanceSmokePlugin-v1.8.6.exe SMOKE_FIRST_RUN_v1.8.6.txt XPXEXSMOKE2.json)
+          echo 'XPXEXSMOKE2 PASS'
 
       - name: Upload diagnostics even on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XenonPerformance-v1.8.5-minimal-xex-diagnostics
+          name: XenonPerformance-v1.8.6-strict-xex-diagnostics
           if-no-files-found: warn
           retention-days: 14
           path: |
             build_xex_smoke/build.log
             build_xex_smoke/XenonPerformanceSmokePlugin.exe
 
-      - name: Upload inert XEX smoke bundle
+      - name: Upload strict XEX smoke bundle
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XenonPerformance-v1.8.5-Minimal-XEX
+          name: XenonPerformance-v1.8.6-Strict-PowerPCBE-XEX
           compression-level: 9
           retention-days: 14
           path: build_xex_smoke/release/
