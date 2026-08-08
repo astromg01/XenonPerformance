@@ -47,6 +47,7 @@ static void revert_profile(void *raw_context,
 int main(void)
 {
     XpAutoMode mode;
+    XpIdentityStabilizer stabilizer;
     TestContext context_a = {0, 0, true};
     TestContext context_b = {0, 0, true};
     XpExecutionIdentity game_a = identity(0x11111111u, 0xAAAA0001u,
@@ -66,7 +67,28 @@ int main(void)
     XpExecutionIdentity mismatch;
     XpExecutionIdentity no_title = {0};
 
-    assert(XP_AUTO_MODE_POLL_INTERVAL_MS == 2000u);
+    assert(XP_AUTO_MODE_POLL_INTERVAL_MS == 5000u);
+    assert(XP_AUTO_MODE_INITIAL_DELAY_MS == 10000u);
+    assert(XP_AUTO_MODE_STABLE_SAMPLES == 2u);
+
+    assert(!xp_auto_mode_is_collectable_title(0));
+    assert(!xp_auto_mode_is_collectable_title(0xFFFF0055u));
+    assert(xp_auto_mode_is_collectable_title(0x425307E6u));
+
+    xp_identity_stabilizer_init(&stabilizer);
+    assert(!xp_identity_stabilizer_update(&stabilizer, 0xFFFF0055u,
+                                          0x80001000u));
+    assert(stabilizer.stable_samples == 0);
+    assert(!xp_identity_stabilizer_update(&stabilizer, 0x425307E6u,
+                                          0x80002000u));
+    assert(xp_identity_stabilizer_update(&stabilizer, 0x425307E6u,
+                                         0x80002000u));
+    assert(stabilizer.stable_samples == XP_AUTO_MODE_STABLE_SAMPLES);
+    assert(!xp_identity_stabilizer_update(&stabilizer, 0x425307E6u,
+                                          0x80003000u));
+    assert(stabilizer.stable_samples == 1);
+    assert(!xp_identity_stabilizer_update(&stabilizer, 0, 0));
+    assert(stabilizer.stable_samples == 0);
 
     xp_auto_mode_init(&mode);
     assert(mode.state == XP_AUTO_DISABLED);
@@ -143,6 +165,6 @@ int main(void)
     assert(xp_auto_mode_update(&mode, NULL, profiles, 2, armed) ==
            XP_AUTO_NO_TITLE);
 
-    puts("XPAUTO1 PASS: exact identity, dry-run, no-op and rollback gates validated");
+    puts("XPAUTO2 PASS: stable game identity, dry-run, no-op and rollback gates validated");
     return 0;
 }

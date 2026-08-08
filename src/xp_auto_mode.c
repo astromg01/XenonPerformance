@@ -60,6 +60,49 @@ void xp_auto_mode_init(XpAutoMode *mode)
     mode->transition_count = 0;
 }
 
+void xp_identity_stabilizer_init(XpIdentityStabilizer *stabilizer)
+{
+    if (!stabilizer) return;
+
+    stabilizer->pending_title_id = 0;
+    stabilizer->pending_module_cookie = 0;
+    stabilizer->stable_samples = 0;
+}
+
+bool xp_auto_mode_is_collectable_title(uint32_t title_id)
+{
+    if (title_id == 0) return false;
+
+    /* Dashboards and homebrew system titles use the reserved FF prefix. */
+    return (title_id & 0xFF000000u) != 0xFF000000u;
+}
+
+bool xp_identity_stabilizer_update(XpIdentityStabilizer *stabilizer,
+                                   uint32_t title_id,
+                                   uint32_t module_cookie)
+{
+    if (!stabilizer) return false;
+
+    if (!xp_auto_mode_is_collectable_title(title_id) || module_cookie == 0) {
+        xp_identity_stabilizer_init(stabilizer);
+        return false;
+    }
+
+    if (stabilizer->pending_title_id != title_id ||
+        stabilizer->pending_module_cookie != module_cookie) {
+        stabilizer->pending_title_id = title_id;
+        stabilizer->pending_module_cookie = module_cookie;
+        stabilizer->stable_samples = 1;
+        return XP_AUTO_MODE_STABLE_SAMPLES <= 1u;
+    }
+
+    if (stabilizer->stable_samples < XP_AUTO_MODE_STABLE_SAMPLES) {
+        stabilizer->stable_samples++;
+    }
+
+    return stabilizer->stable_samples >= XP_AUTO_MODE_STABLE_SAMPLES;
+}
+
 bool xp_execution_identity_equal(const XpExecutionIdentity *left,
                                  const XpExecutionIdentity *right)
 {

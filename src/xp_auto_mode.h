@@ -4,7 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define XP_AUTO_MODE_POLL_INTERVAL_MS 2000u
+#define XP_AUTO_MODE_POLL_INTERVAL_MS 5000u
+#define XP_AUTO_MODE_INITIAL_DELAY_MS 10000u
+#define XP_AUTO_MODE_STABLE_SAMPLES 2u
 #define XP_EXECUTION_DIGEST_SIZE 20u
 
 typedef struct XpExecutionIdentity {
@@ -51,7 +53,21 @@ typedef struct XpAutoMode {
     uint32_t transition_count;
 } XpAutoMode;
 
+typedef struct XpIdentityStabilizer {
+    uint32_t pending_title_id;
+    uint32_t pending_module_cookie;
+    uint32_t stable_samples;
+} XpIdentityStabilizer;
+
 void xp_auto_mode_init(XpAutoMode *mode);
+
+void xp_identity_stabilizer_init(XpIdentityStabilizer *stabilizer);
+
+bool xp_identity_stabilizer_update(XpIdentityStabilizer *stabilizer,
+                                   uint32_t title_id,
+                                   uint32_t module_cookie);
+
+bool xp_auto_mode_is_collectable_title(uint32_t title_id);
 
 bool xp_execution_identity_equal(const XpExecutionIdentity *left,
                                  const XpExecutionIdentity *right);

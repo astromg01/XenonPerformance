@@ -1,4 +1,4 @@
-name: Xenon Performance Stage B Auto Mode
+name: Xenon Performance Stage B1 Stable Collector
 
 on:
   push:
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   validate-core:
-    name: Validate exact-match Auto Mode state machine
+    name: Validate stable exact-match Auto Mode state machine
     runs-on: ubuntu-24.04
     timeout-minutes: 5
 
@@ -39,26 +39,30 @@ jobs:
       - name: Run state-machine tests
         run: |
           set -euo pipefail
-          ./build_auto_mode/xp_auto_mode_tests | tee build_auto_mode/XPAUTO1.txt
-          grep -F 'XPAUTO1 PASS' build_auto_mode/XPAUTO1.txt
+          ./build_auto_mode/xp_auto_mode_tests | tee build_auto_mode/XPAUTO2.txt
+          grep -F 'XPAUTO2 PASS' build_auto_mode/XPAUTO2.txt
 
       - name: Prove policy defaults and interval
         run: |
           set -euo pipefail
-          grep -F '#define XP_AUTO_MODE_POLL_INTERVAL_MS 2000u' src/xp_auto_mode.h
+          grep -F '#define XP_AUTO_MODE_POLL_INTERVAL_MS 5000u' src/xp_auto_mode.h
+          grep -F '#define XP_AUTO_MODE_INITIAL_DELAY_MS 10000u' src/xp_auto_mode.h
+          grep -F '#define XP_AUTO_MODE_STABLE_SAMPLES 2u' src/xp_auto_mode.h
+          grep -F 'xp_auto_mode_is_collectable_title' src/xp_auto_mode.c
+          grep -F 'pending_module_cookie' src/xp_auto_mode.c
           grep -F 'policy.dry_run || !policy.armed' src/xp_auto_mode.c
           grep -F 'XP_AUTO_UNKNOWN_TITLE' src/xp_auto_mode.c
-          echo 'XPAUTOPOLICY1 PASS: exact match, dry-run and no-op policy present'
+          echo 'XPAUTOPOLICY2 PASS: stable exact match, dry-run and no-op policy present'
 
       - name: Upload core validation
         uses: actions/upload-artifact@v4
         with:
-          name: XenonPerformance-Stage-B-Auto-Mode-Core
+          name: XenonPerformance-Stage-B1-Stable-Collector-Core
           retention-days: 14
-          path: build_auto_mode/XPAUTO1.txt
+          path: build_auto_mode/XPAUTO2.txt
 
   build-resident-xex:
-    name: Build resident POWERPCBE Auto Mode DLL
+    name: Build resident POWERPCBE stable collector DLL
     needs: validate-core
     runs-on: ubuntu-24.04
     timeout-minutes: 12
@@ -74,11 +78,11 @@ jobs:
             build-essential binutils binutils-powerpc-linux-gnu \
             cmake ninja-build git python3 ca-certificates zip
 
-      - name: Build Stage B resident DLL
+      - name: Build Stage B1 resident DLL
         shell: bash
         run: |
           set -euo pipefail
-          OUT="$GITHUB_WORKSPACE/build_stage_b"
+          OUT="$GITHUB_WORKSPACE/build_stage_b1"
           SYNTH_SRC="$OUT/synthxex-src"
           SYNTH_BUILD="$OUT/synthxex-build"
           REL="$OUT/release"
@@ -88,21 +92,28 @@ jobs:
           : > "$LOG"
           exec > >(tee -a "$LOG") 2>&1
 
-          echo 'XPAUTOB stage=source-gates begin'
+          echo 'XPAUTOB1 stage=source-gates begin'
           grep -Fq 'ORD_XAM_GET_CURRENT_TITLE_ID' src/xp_auto_mode_stage_b.s
           grep -Fq 'ORD_EX_CREATE_THREAD' src/xp_auto_mode_stage_b.s
           grep -Fq 'ORD_KE_DELAY_EXECUTION_THREAD' src/xp_auto_mode_stage_b.s
+          grep -Fq 'ORD_MM_IS_ADDRESS_VALID' src/xp_auto_mode_stage_b.s
+          grep -Fq 'ORD_RTL_IMAGE_XEX_HEADER_FIELD' src/xp_auto_mode_stage_b.s
+          grep -Fq 'ORD_XAM_CREATE_FILE_A' src/xp_auto_mode_stage_b.s
+          grep -Fq 'ORD_XAM_WRITE_FILE' src/xp_auto_mode_stage_b.s
+          grep -Fq 'identity_path_usb0' src/xp_auto_mode_stage_b.s
+          grep -Fq 'XP_STABLE_SAMPLES' src/xp_auto_mode_stage_b.s
+          grep -Fq 'srwi    r12, r15, 24' src/xp_auto_mode_stage_b.s
           grep -Fq 'XEX_HEADER_EXECUTION_INFO' src/xp_auto_mode_stage_b.s
           grep -A1 '^profile_registry_count:' src/xp_auto_mode_stage_b.s | grep -Eq '\.long[[:space:]]+0'
           ! grep -Eq '\.loaded|NtCreateFile|NtWriteFile|XNotifyQueueUI|MmSetAddressProtect|MmDoubleMapMemory|HalSendSMCMessage|HalWriteArgonEeprom' \
             src/xp_auto_mode_stage_b.s
-          echo 'XPAUTOB stage=source-gates pass profile_count=0 writes=0'
+          echo 'XPAUTOB1 stage=source-gates pass profile_count=0 game_writes=0 collector_attempts=1'
 
-          echo 'XPAUTOB stage=powerpc begin'
+          echo 'XPAUTOB1 stage=powerpc begin'
           powerpc-linux-gnu-as -mregnames -mppc64 \
             src/xp_auto_mode_stage_b.s -o "$OUT/xp_auto_mode_stage_b.o"
           powerpc-linux-gnu-ld \
-            -Ttext=0x82010000 -e _start \
+            -Ttext=0x91D10000 -e _start \
             -o "$OUT/xp_auto_mode_stage_b.elf" \
             "$OUT/xp_auto_mode_stage_b.o"
           powerpc-linux-gnu-objcopy -O binary -j .text \
@@ -115,11 +126,13 @@ jobs:
           grep -q '<_start>' "$REL/xp_auto_mode_stage_b.disasm.txt"
           grep -q '<auto_mode_thread>' "$REL/xp_auto_mode_stage_b.disasm.txt"
           grep -q '<capture_execution_identity>' "$REL/xp_auto_mode_stage_b.disasm.txt"
+          grep -q '<write_identity_file>' "$REL/xp_auto_mode_stage_b.disasm.txt"
           grep -q '<find_exact_profile>' "$REL/xp_auto_mode_stage_b.disasm.txt"
           grep -q 'stwu' "$REL/xp_auto_mode_stage_b.disasm.txt"
           ! grep -Eq '\bstdu\b|\bstd\b|\bld\b|\bclrldi\b' \
             "$REL/xp_auto_mode_stage_b.disasm.txt"
-          echo 'XPAUTOB stage=powerpc pass'
+          grep -q '^91d10000 T _start$' "$REL/xp_auto_mode_stage_b.symbols.txt"
+          echo 'XPAUTOB1 stage=powerpc pass text_base=0x91D10000'
 
           printf '.section .text\n.globl _start\n_start:\n.incbin "%s"\n' \
             "$OUT/xp_auto_mode_stage_b.bin" > "$OUT/wrapper.s"
@@ -127,7 +140,7 @@ jobs:
           ld -mi386pe --dll --subsystem 14 \
             --major-subsystem-version 1 --minor-subsystem-version 0 \
             --major-os-version 0 --minor-os-version 0 \
-            --disable-dynamicbase --image-base 0x82000000 \
+            --disable-dynamicbase --image-base 0x91D00000 \
             --section-alignment 0x10000 --file-alignment 0x200 \
             --disable-long-section-names -e _start \
             -o "$OUT/XenonPerformancePlugin.exe" "$OUT/wrapper.o"
@@ -158,9 +171,9 @@ jobs:
           if machine != 0x01F2: errors.append('machine')
           if not (characteristics & 0x2000): errors.append('not-dll')
           if subsystem != 0x000E: errors.append('subsystem')
-          if image_base != 0x82000000: errors.append('image-base')
+          if image_base != 0x91D00000: errors.append('image-base')
           if alignment != 0x10000: errors.append('alignment')
-          if image_base + entry != 0x82010000: errors.append('entry-address')
+          if image_base + entry != 0x91D10000: errors.append('entry-address')
           section_table = optional + optional_size
           mapped = False
           for index in range(section_count):
@@ -177,7 +190,7 @@ jobs:
           print('XPPEAUTOB PASS machine=POWERPCBE sha256=' + hashlib.sha256(data).hexdigest())
           PY
 
-          echo 'XPAUTOB stage=synthxex begin'
+          echo 'XPAUTOB1 stage=synthxex begin'
           git init -q "$SYNTH_SRC"
           git -C "$SYNTH_SRC" remote add origin https://github.com/OpenXeChain/SynthXEX.git
           git -C "$SYNTH_SRC" fetch -q --depth 1 origin "$SYNTH_COMMIT"
@@ -187,10 +200,10 @@ jobs:
           cmake --build "$SYNTH_BUILD" --parallel 4
           "$SYNTH_BUILD/synthxex" \
             --input "$OUT/XenonPerformancePlugin.exe" \
-            --output "$REL/XenonPerformancePlugin-Stage-B.xex" \
+            --output "$REL/XenonPerformancePlugin-Stage-B1.xex" \
             --type dll
 
-          python3 - "$REL/XenonPerformancePlugin-Stage-B.xex" <<'PY'
+          python3 - "$REL/XenonPerformancePlugin-Stage-B1.xex" <<'PY'
           import hashlib,struct,sys
           path = sys.argv[1]
           data = open(path, 'rb').read()
@@ -200,9 +213,19 @@ jobs:
           if not errors:
               flags, pe_offset, _, _, count = struct.unpack('>IIIII', data[4:24])
               if flags != 0x8: errors.append(f'module-flags=0x{flags:x}')
+              security_offset = struct.unpack_from('>I', data, 0x10)[0]
+              load_address = struct.unpack_from('>I', data, security_offset + 0x110)[0]
+              if load_address != 0x91D00000:
+                  errors.append(f'load-address=0x{load_address:08x}')
               ids = [struct.unpack('>II', data[24+i*8:32+i*8])[0]
                      for i in range(count)]
               if 0x00010100 not in ids: errors.append('entry-header')
+              entry_value = next((struct.unpack('>II', data[24+i*8:32+i*8])[1]
+                                  for i in range(count)
+                                  if struct.unpack('>II', data[24+i*8:32+i*8])[0] == 0x00010100),
+                                 0)
+              if entry_value != 0x91D10000:
+                  errors.append(f'xex-entry=0x{entry_value:08x}')
               if pe_offset >= len(data): errors.append('pe-offset')
               if pe_offset < len(data):
                   pe_data = data[pe_offset:]
@@ -215,14 +238,18 @@ jobs:
           PY
 
           cat > "$REL/README_FIRST_RUN.txt" <<'TXT'
-          XENON PERFORMANCE — STAGE B AUTO MODE
+          XENON PERFORMANCE — STAGE B1 STABLE COLLECTOR
 
-          Resident DashLaunch DLL. It polls the current Title ID every two seconds
-          and requires an exact XEX identity before a profile may run.
+          Resident DashLaunch DLL linked at the safe 0x91D00000 plugin base.
+          It waits 10 seconds, then polls every 5 seconds. Dashboards are ignored
+          and a game must be stable for two samples before metadata is read.
 
-          This build ships with profile_count=0 and writes=0.
+          This build ships with profile_count=0 and game-memory writes=0.
           It does not improve FPS yet and never patches an unknown title.
-          It creates no notification, log or .loaded marker.
+          After opening a game, wait about 15 seconds. The collector writes:
+            Usb0:\XenonPerformanceIdentity.txt
+          with a fallback to:
+            Usb:\XenonPerformanceIdentity.txt
 
           Console path:
             Usb0:\XenonPerformancePlugin.xex
@@ -230,29 +257,36 @@ jobs:
             plugin1 = Usb:\XenonPerformancePlugin.xex
           TXT
 
-          cp "$REL/XenonPerformancePlugin-Stage-B.xex" \
+          cp "$REL/XenonPerformancePlugin-Stage-B1.xex" \
              "$REL/XenonPerformancePlugin.xex"
           cp "$OUT/XenonPerformancePlugin.exe" "$REL/"
           cp src/xp_auto_mode_stage_b.s "$REL/"
           cp docs/STAGE_B_AUTO_MODE.md "$REL/"
 
-          python3 - "$REL/XenonPerformancePlugin.xex" "$REL/XP_AUTO_MODE_STAGE_B.json" <<'PY'
+          python3 - "$REL/XenonPerformancePlugin.xex" "$REL/XP_AUTO_MODE_STAGE_B1.json" <<'PY'
           import hashlib,json,os,sys
           path, output = sys.argv[1:]
           data = open(path, 'rb').read()
           report = {
-            'schema': 'XP_AUTO_MODE_STAGE_B',
-            'stage': 'B',
+            'schema': 'XP_AUTO_MODE_STAGE_B1',
+            'stage': 'B1',
             'architecture': 'resident DLL / strict POWERPCBE',
-            'poll_interval_ms': 2000,
+            'image_base': '0x91D00000',
+            'initial_delay_ms': 10000,
+            'poll_interval_ms': 5000,
+            'stable_samples': 2,
             'identity': ['title_id', 'media_id', 'version', 'base_version',
                          'xex_header_digest_sha1'],
             'profile_count': 0,
             'unknown_title_behavior': 'no-op',
-            'filesystem_io': False,
+            'dashboard_behavior': 'skip without XEX metadata read',
+            'filesystem_io': 'identity report only',
+            'collector_paths': ['Usb0:\\XenonPerformanceIdentity.txt',
+                                'Usb:\\XenonPerformanceIdentity.txt'],
+            'collector_attempts_per_identity_transition': 1,
             'notifications': False,
             'hardware_writes_enabled': False,
-            'writes': 0,
+            'game_memory_writes': 0,
             'fps_gain_claimed': False,
             'xex': {
               'name': os.path.basename(path),
@@ -265,34 +299,34 @@ jobs:
           PY
 
           (cd "$REL" && sha256sum * > SHA256SUMS.txt)
-          (cd "$REL" && zip -9 XenonPerformance-Stage-B-Auto-Mode.zip \
-            XenonPerformancePlugin.xex XenonPerformancePlugin-Stage-B.xex \
+          (cd "$REL" && zip -9 XenonPerformance-Stage-B1-Stable-Collector.zip \
+            XenonPerformancePlugin.xex XenonPerformancePlugin-Stage-B1.xex \
             XenonPerformancePlugin.exe xp_auto_mode_stage_b.s \
             xp_auto_mode_stage_b.disasm.txt xp_auto_mode_stage_b.symbols.txt \
-            STAGE_B_AUTO_MODE.md README_FIRST_RUN.txt XP_AUTO_MODE_STAGE_B.json \
+            STAGE_B_AUTO_MODE.md README_FIRST_RUN.txt XP_AUTO_MODE_STAGE_B1.json \
             SHA256SUMS.txt)
-          echo 'XPAUTOB PASS profile_count=0 writes=0'
+          echo 'XPAUTOB1 PASS image_base=0x91D00000 profile_count=0 game_writes=0 collector=enabled'
 
       - name: Upload diagnostics even on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: XenonPerformance-Stage-B-Auto-Mode-Diagnostics
+          name: XenonPerformance-Stage-B1-Stable-Collector-Diagnostics
           if-no-files-found: warn
           retention-days: 14
           path: |
-            build_stage_b/build.log
-            build_stage_b/xp_auto_mode_stage_b.elf
-            build_stage_b/xp_auto_mode_stage_b.bin
-            build_stage_b/release/xp_auto_mode_stage_b.disasm.txt
-            build_stage_b/release/xp_auto_mode_stage_b.symbols.txt
-            build_stage_b/XenonPerformancePlugin.exe
+            build_stage_b1/build.log
+            build_stage_b1/xp_auto_mode_stage_b.elf
+            build_stage_b1/xp_auto_mode_stage_b.bin
+            build_stage_b1/release/xp_auto_mode_stage_b.disasm.txt
+            build_stage_b1/release/xp_auto_mode_stage_b.symbols.txt
+            build_stage_b1/XenonPerformancePlugin.exe
 
-      - name: Upload Stage B bundle
+      - name: Upload Stage B1 bundle
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: XenonPerformance-Stage-B-Auto-Mode
+          name: XenonPerformance-Stage-B1-Stable-Collector
           compression-level: 9
           retention-days: 14
-          path: build_stage_b/release/
+          path: build_stage_b1/release/
