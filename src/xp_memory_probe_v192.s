@@ -4,9 +4,8 @@
 # Uses the 32-bit ABI style used by FreeChainXenon samples.
 # No XAM UI calls from the loader thread. No NAND/SMC/game-memory writes.
 #
-# DLL_PROCESS_ATTACH (r4 == 1): resolve MmQueryStatistics (ordinal 198),
-# query MM_STATISTICS, validate basic fields, and return TRUE on success.
-# Other DLL reasons return TRUE immediately.
+# Every entry invocation performs the same read-only probe so a clean loader
+# return proves MmQueryStatistics was actually resolved and queried.
 
 .set ORD_MM_QUERY_STATISTICS, 198
 
@@ -19,10 +18,6 @@ _start:
     stwu    r1, -0x100(r1)
     stw     r0,  0x08(r1)
     stw     r31, 0x0c(r1)
-
-    # Only probe on DLL_PROCESS_ATTACH.
-    cmpwi   r4, 1
-    bne     probe_success
 
     li      r3, ORD_MM_QUERY_STATISTICS
     bl      get_kernel_export
@@ -57,7 +52,7 @@ zero_stats:
     bgt     probe_failure
 
 probe_success:
-    li      r3, 1              # TRUE: DLL load accepted / probe passed
+    li      r3, 1              # TRUE: memory probe passed
     b       probe_return
 
 probe_failure:
